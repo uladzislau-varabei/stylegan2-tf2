@@ -1,0 +1,15 @@
+# Folders generated in training
+models
+# Benchmarking dir
+temp_dir
+
+# Jupyter notebooks
+.ipynb_checkpoints
+*.ipynb
+
+# Other
+results
+.idea
+__pycache__
+*.png
+*.txt

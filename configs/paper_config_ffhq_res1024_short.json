@@ -1,0 +1,35 @@
+{
+    "model_name": "paper_config_ffhq_res1024_short",
+    "images_paths_filename": "ffhq.txt",
+    "target_resolution": 1024,
+    "use_mixed_precision": false,
+    "fused_bias_act": false,
+    "use_XLA": false,
+    "implementation": "custom_grad",
+    "total_kimages": 25000,
+    "batch_size": 4,
+    "G_loss_fn": "G_logistic_ns_pathreg",
+    "D_loss_fn": "D_logistic_simplegp",
+    "G_loss_fn_params": {
+        "pl_batch_shrink": 2,
+        "pl_decay": 0.01,
+        "pl_weight": 2.0
+    },
+    "D_loss_fn_params": {
+        "r1_gamma": 10.0
+    },
+    "G_learning_rate": 0.001,
+    "D_learning_rate": 0.001,
+    "max_models_to_keep": 5,
+    "summary_scalars_every_kimages": 2.5,
+    "summary_hists_every_kimages": 25,
+    "save_model_every_kimages": 100,
+    "save_images_every_kimages": 2.5,
+    "run_metrics_every_kimages": 50,
+    "metrics": {
+        "FID": {
+            "num_samples": 50000
+        }
+    },
+    "mirror_augment": true
+}
