@@ -856,23 +856,23 @@ def pixel_norm_layer(x, use_fp16=None, scope='', config=None):
     return PixelNorm(dtype=dtype, use_xla=use_xla, data_format=data_format, scope=scope)(x)
 
 
-def downscale2d_layer(x, factor, use_fp16=None, config=None):
+def downscale2d_layer(x, factor, use_fp16=None, config=None, name=None):
     resample_kernel = config.get(cfg.RESAMPLE_KERNEL, cfg.DEFAULT_RESAMPLE_KERNEL)
     use_xla = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
     data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     dtype = layer_dtype(LAYERS.downscale2d, use_fp16=use_fp16)
     return Downscale2d(
-        factor=factor, resample_kernel=resample_kernel, dtype=dtype, use_xla=use_xla, data_format=data_format
+        factor=factor, resample_kernel=resample_kernel, dtype=dtype, use_xla=use_xla, data_format=data_format, name=name
     )(x)
 
 
-def upscale2d_layer(x, factor, use_fp16=None, config=None):
+def upscale2d_layer(x, factor, use_fp16=None, config=None, name=None):
     resample_kernel = config.get(cfg.RESAMPLE_KERNEL, cfg.DEFAULT_RESAMPLE_KERNEL)
     use_xla = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
     data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     dtype = layer_dtype(LAYERS.upscale2d, use_fp16=use_fp16)
     return Upscale2d(
-        factor=factor, resample_kernel=resample_kernel, dtype=dtype, use_xla=use_xla, data_format=data_format
+        factor=factor, resample_kernel=resample_kernel, dtype=dtype, use_xla=use_xla, data_format=data_format, name=name
     )(x)
 
 

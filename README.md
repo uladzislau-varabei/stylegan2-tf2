@@ -135,6 +135,7 @@ Supported metrics are:
 
 ## Further improvements
 
+- Add support for dataset with labels;
 - Add multi GPU support;
 - Fix training in a single process;
 - Fix problems with name scopes inside `tf.function()`. 

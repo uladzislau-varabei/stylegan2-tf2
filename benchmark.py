@@ -49,7 +49,7 @@ if __name__ == '__main__':
 ########## --- Results --- ##########
 # | Res | FP16 res | XLA | Upfirdn IMPL | BS | MBSTD GS | GBASE | DBASE | G loss shrink | G map act | G act | D act | Per layer compile | Fast model | Imgs/persec | Compile | Max mem | Cur mem |
 #  ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-# | 256 |     5    |  +  | custom_grad  | 4  |    2     | 8192  | 8192  |        2      |    lrelu  | lrelu | lrelu |        +          |      -     |     5.661   |         |         |         |
+# | 256 |     5    |  +  | custom_grad  | 4  |    2     | 8192  | 8192  |        2      |   lrelu   | lrelu | lrelu |        +          |      -     |     5.661   |         |         |         |
 #
 #
 #

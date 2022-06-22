@@ -19,8 +19,8 @@ def parse_args():
         '--config_path',
         help='Path to a config of a model to train (json format)',
         #default=os.path.join('configs', 'demo_config.json'),
-        default=os.path.join('configs', 'debug_config.json'),
-        #default=os.path.join('configs', 'lsun_living_room.json'),
+        #default=os.path.join('configs', 'debug_config.json'),
+        default=os.path.join('configs', 'lsun_living_room.json'),
         #default=os.path.join('configs', 'lsun_car_512x384.json'),
         #required=True
     )
@@ -55,8 +55,8 @@ def run_train_stage(config, images_paths):
 def train_model(config):
     images_paths = load_images_paths(config)
 
-    # run_process(target=trace_graphs, args=(config, ))
-    # sleep(3)
+    run_process(target=trace_graphs, args=(config, ))
+    sleep(3)
 
     train_start_time = time.time()
     logging.info(f'Training StyleGAN2 model...')
@@ -68,6 +68,8 @@ def train_model(config):
         args=(config, images_paths)
     )
     """
+    print('Manual exit')
+    exit()
     # prepare_gpu('growth')
     prepare_gpu('limit', memory_limit=5000)
     run_train_stage(config, images_paths)

@@ -12,7 +12,7 @@ from utils import level_of_details, validate_data_format, to_int_dict,\
     get_start_fp16_resolution, should_use_fp16, adjust_clamp,\
     NHWC_FORMAT, NCHW_FORMAT, RESNET_ARCHITECTURE, SKIP_ARCHITECTURE
 from tf_utils import generate_latents, get_compute_dtype, lerp, FastTFModel,\
-    DEFAULT_DATA_FORMAT, GAIN_INIT_MODE_DICT, GAIN_ACTIVATION_FUNS_DICT
+    DEFAULT_DATA_FORMAT, GAIN_INIT_MODE_DICT, GAIN_ACTIVATION_FUNS_DICT, PLOT_MODEL_KWARGS
 
 
 def n_filters(stage, fmap_base, fmap_decay, fmap_max):
@@ -103,7 +103,9 @@ class GeneratorMapping(ModelConfig):
         with tf.name_scope('Broadcast'):
             x = tf.tile(x[:, tf.newaxis], [1, self.num_styles, 1])
 
-        self.G_mapping = tf.keras.Model(self.latents, tf.identity(x, name='dlatents'), name='G_mapping')
+        dlatents = tf.identity(x, name='dlatents')
+        self.G_mapping = tf.keras.Model(self.latents, dlatents, name='G_mapping')
+        # self.G_mapping = FastTFModel(self.latents, dlatents, use_xla=self.use_xla, name='G_mapping')
 
 
 class GeneratorStyle(tf.keras.Model, ModelConfig):
@@ -242,13 +244,12 @@ class Generator(ModelConfig):
         self.G_fmap_decay      = config.get(cfg.G_FMAP_DECAY, cfg.DEFAULT_FMAP_DECAY)
         self.G_fmap_max        = config.get(cfg.G_FMAP_MAX, cfg.DEFAULT_FMAP_MAX)
         self.G_act_name        = config.get(cfg.G_ACTIVATION, cfg.DEFAULT_G_ACTIVATION)
-        self.blur_filter       = config.get(cfg.RESAMPLE_KERNEL, cfg.DEFAULT_RESAMPLE_KERNEL)
 
         self.G_weights_init_mode = config.get(cfg.G_WEIGHTS_INIT_MODE, None)
         if self.G_weights_init_mode is None:
-            self.gain = GAIN_ACTIVATION_FUNS_DICT[self.G_act_name]
+            self.G_gain = GAIN_ACTIVATION_FUNS_DICT[self.G_act_name]
         else:
-            self.gain = GAIN_INIT_MODE_DICT[self.G_weights_init_mode]
+            self.G_gain = GAIN_INIT_MODE_DICT[self.G_weights_init_mode]
 
         self.num_layers = self.resolution_log2 * 2 - 2
         self.G_model = None
@@ -291,16 +292,20 @@ class Generator(ModelConfig):
 
         return tf.keras.Model([x, self.dlatents], y, name=block_name)
 
-    def to_rgb(self, x, res):
-        return self.toRGB_layers[res]([x, self.dlatents])
+    def to_rgb(self, x, y, res):
+        t = self.toRGB_layers[res]([x, self.dlatents])
+        if y is not None:
+            use_fp16 = self.should_use_fp16(res)
+            t = skip_merge_layer(t, y, use_fp16=use_fp16, name=f'{2**res}x{2**res}/Skip_merge/Lambda') # Looks better in TensorBoard
+        return t
 
     def fc(self, x, units, gain=None, use_fp16=None, scope=''):
-        if gain is None: gain = self.gain
+        if gain is None: gain = self.G_gain
         return fully_connected_layer(x, units, gain=gain, use_fp16=use_fp16, scope=scope, config=self.config)
 
     def conv2d(self, x, fmaps, kernel_size=None, gain=None, up=False, use_fp16=None, scope=''):
         if kernel_size is None: kernel_size = self.G_kernel_size
-        if gain is None: gain = self.gain
+        if gain is None: gain = self.G_gain
         return conv2d_layer(
             x, fmaps, kernel_size=kernel_size, gain=gain, up=up,
             use_fp16=use_fp16, scope=scope, config=self.config
@@ -308,14 +313,14 @@ class Generator(ModelConfig):
 
     def modulated_conv2d(self, x, dlatents, fmaps, kernel_size=None, up=False, demodulate=True, gain=None, use_fp16=None, scope=''):
         if kernel_size is None: kernel_size = self.G_kernel_size
-        if gain is None: gain = self.gain
+        if gain is None: gain = self.G_gain
         return modulated_conv2d_layer(
             x, dlatents, fmaps=fmaps, kernel_size=kernel_size, up=up, demodulate=demodulate,
             use_fp16=use_fp16, gain=gain, scope=scope, config=self.config
         )
 
-    def upscale2d(self, x, use_fp16=None):
-        return upscale2d_layer(x, factor=2, use_fp16=use_fp16, config=self.config)
+    def upscale2d(self, x, use_fp16=None, name=None):
+        return upscale2d_layer(x, factor=2, use_fp16=use_fp16, config=self.config, name=name)
 
     def bias_act(self, x, act_name=None, clamp=None, use_fp16=None, scope=''):
         if act_name is None: act_name = self.G_act_name
@@ -338,63 +343,62 @@ class Generator(ModelConfig):
         x = self.bias_act(x, clamp=self.conv_clamp, use_fp16=use_fp16, scope=scope)
         return x
 
-    def input_block(self):
+    def input_G_block(self):
         use_fp16 = self.should_use_fp16(2)
+        y = None
         with tf.name_scope('4x4'):
             with tf.name_scope('Const') as scope:
                 fmaps = self.fmap_const if self.fmap_const is not None else self.G_n_filters(1)
                 x = const_layer(self.dlatents[:, 0], fmaps, use_fp16=use_fp16, scope=scope, config=self.config)
             with tf.name_scope('Conv') as scope:
                 x = self.style_block(x, layer_idx=0, fmaps=self.G_n_filters(1), use_fp16=use_fp16, scope=scope)
-        return x
+            if self.G_architecture == SKIP_ARCHITECTURE:
+                y = self.to_rgb(x, y, 2)
+        return x, y
 
     def G_block(self, x, res):
         # res = 3 ... resolution_log2
+        t = x
         use_fp16 = self.should_use_fp16(res)
-        with tf.name_scope(f'{2**res}x{2**res}'):
+        with tf.name_scope(f'{2**res}x{2**res}') as top_scope:
             with tf.name_scope('Conv0_up') as scope:
                 x = self.style_block(x, res * 2 - 5, fmaps=self.G_n_filters(res - 1), up=True, use_fp16=use_fp16, scope=scope)
             with tf.name_scope('Conv1') as scope:
                 x = self.style_block(x, res * 2 - 4, fmaps=self.G_n_filters(res - 1), use_fp16=use_fp16, scope=scope)
+            if self.G_architecture == RESNET_ARCHITECTURE:
+                with tf.name_scope('Skip') as scope:
+                    t = self.conv2d(t, fmaps=self.G_n_filters(res - 1), kernel_size=1, up=True, use_fp16=use_fp16, scope=scope)
+                    x = resnet_merge_layer(x, t, use_fp16=use_fp16, name=f'{2**res}x{2**res}/Resnet_merge/Lambda') # Looks better in TensorBoard
         return x
 
     def create_G_model(self):
         if self.G_model is None:
             print(f' ...Creating G model...')
-            x = self.input_block()
-            if self.G_architecture == SKIP_ARCHITECTURE:
-                t = self.to_rgb(x, 2)
-            else: # if self.G_architecture == RESNET_ARCHITECTURE:
-                t = x
+            x, y = self.input_G_block()
             for res in range(3, self.resolution_log2 + 1):
                 use_fp16 = self.should_use_fp16(res)
-                merge_postfix = f'merge_{2**res}x{2**res}'
-                # 1. apply block
                 x = self.G_block(x, res)
-                # 2. update t and x
-                if self.G_architecture == RESNET_ARCHITECTURE:
-                    with tf.name_scope(f'Skip_{2**res}x{2**res}') as scope:
-                        x = self.conv2d(x, fmaps=self.G_n_filters(res - 1), up=True, use_fp16=use_fp16, scope=scope)
-                    t = resnet_merge_layer(x, t, use_fp16=use_fp16, name=f'Resnet_{merge_postfix}')
-                    x = t
-                    if res == self.resolution_log2:
-                        t = self.to_rgb(t, res)
-                else: # if self.G_architecture == SKIP_ARCHITECTURE:
-                    t = self.upscale2d(t, use_fp16=use_fp16)
-                    x_input = self.to_rgb(x, res)
-                    y_input = t
-                    t = skip_merge_layer(x_input, y_input, use_fp16=use_fp16, name=f'Skip_{merge_postfix}')
-
-            self.G_synthesis = tf.keras.Model(
-                self.dlatents, tf.identity(t, name='images_out'), name='G_synthesis'
-            )
-            # Create full G model
+                if self.G_architecture == SKIP_ARCHITECTURE:
+                    y = self.upscale2d(y, use_fp16, name=f'Upscale2d_{2**res}x{2**res}')
+                if self.G_architecture == SKIP_ARCHITECTURE or res == self.resolution_log2:
+                    y = self.to_rgb(x, y, res)
+            images_out = tf.identity(y, name='images_out')
+            # Build models
+            self.G_synthesis = tf.keras.Model(self.dlatents, images_out, name='G_synthesis')
+            # self.G_model = FastTFModel(self.dlatents, images_out, use_xla=self.use_xla, name='G_synthesis')
             self.G_model = GeneratorStyle(self.G_mapping, self.G_synthesis, self.config)
         return self.G_model
 
-    def initialize_G_model(self):
+    def initialize_G_model(self, plot_model=True):
         latents = tf.zeros(shape=[self.batch_size, self.latent_size], dtype=self.model_compute_dtype)
         _ = self.G_model(latents, training=False)
+        if plot_model:
+            try:
+                tf.keras.utils.plot_model(self.G_synthesis, to_file='G_synthesis.png', **PLOT_MODEL_KWARGS)
+                tf.keras.utils.plot_model(self.G_model, to_file='G_model.png', **PLOT_MODEL_KWARGS)
+            except Exception as e:
+                print('No images with G models architecture')
+                print(e)
         print(f' ...Initialized G model...')
 
     def save_G_weights_in_class(self, G_model):
@@ -405,7 +409,8 @@ class Generator(ModelConfig):
 
     def trace_G_graph(self, summary_writer, writer_dir):
         trace_G_input = tf.zeros(shape=[1, self.dlatent_size], dtype=self.model_compute_dtype)
-        trace_G_model = tf.function(self.create_G_model())
+        trace_G_model = tf.function(self.G_model)
+        print('Tracing Generator model...')
         with summary_writer.as_default():
             tf.summary.trace_on(graph=True, profiler=True)
             trace_G_model(trace_G_input)
@@ -434,13 +439,12 @@ class Discriminator(ModelConfig):
         self.D_fmap_decay     = config.get(cfg.D_FMAP_DECAY, cfg.DEFAULT_FMAP_DECAY)
         self.D_fmap_max       = config.get(cfg.D_FMAP_MAX, cfg.DEFAULT_FMAP_MAX)
         self.D_act_name       = config.get(cfg.D_ACTIVATION, cfg.DEFAULT_D_ACTIVATION)
-        self.blur_filter      = config.get(cfg.RESAMPLE_KERNEL, cfg.DEFAULT_RESAMPLE_KERNEL)
 
         self.D_weights_init_mode = config.get(cfg.D_WEIGHTS_INIT_MODE, None)
         if self.D_weights_init_mode is None:
-            self.gain = GAIN_ACTIVATION_FUNS_DICT[self.D_act_name]
+            self.D_gain = GAIN_ACTIVATION_FUNS_DICT[self.D_act_name]
         else:
-            self.gain = GAIN_INIT_MODE_DICT[self.D_weights_init_mode]
+            self.D_gain = GAIN_INIT_MODE_DICT[self.D_weights_init_mode]
 
         self.D_model = None
         self.create_model_layers()
@@ -477,23 +481,27 @@ class Discriminator(ModelConfig):
 
         return tf.keras.Model(x, y, name=block_name)
 
-    def from_rgb(self, x, res):
-        return self.fromRGB_layers[res](x)
+    def from_rgb(self, x, y, res):
+        t = self.fromRGB_layers[res](y)
+        if x is not None:
+            use_fp16 = self.should_use_fp16(res)
+            t = skip_merge_layer(x, t, use_fp16=use_fp16, name=f'{2**res}x{2**res}/Skip_merge/Lambda') # Looks better in TensorBoard
+        return t
 
     def fc(self, x, units, gain=None, use_fp16=None, scope=''):
-        if gain is None: gain = self.gain
+        if gain is None: gain = self.D_gain
         return fully_connected_layer(x, units, gain=gain, use_fp16=use_fp16, scope=scope, config=self.config)
 
     def conv2d(self, x, fmaps, kernel_size=None, gain=None, down=False, use_fp16=None, scope=''):
         if kernel_size is None: kernel_size = self.D_kernel_size
-        if gain is None: gain = self.gain
+        if gain is None: gain = self.D_gain
         return conv2d_layer(
             x, fmaps, kernel_size=kernel_size, gain=gain, down=down,
             use_fp16=use_fp16, scope=scope, config=self.config
         )
 
-    def downscale2d(self, x, use_fp16=None):
-        return downscale2d_layer(x, factor=2, use_fp16=use_fp16, config=self.config)
+    def downscale2d(self, x, use_fp16=None, name=None):
+        return downscale2d_layer(x, factor=2, use_fp16=use_fp16, config=self.config, name=name)
 
     def bias_act(self, x, act_name=None, clamp=None, use_fp16=None, scope=''):
         if act_name is None: act_name = self.D_act_name
@@ -510,82 +518,71 @@ class Discriminator(ModelConfig):
         return fused_bias_act_layer(**kwargs) if self.fused_bias_act else bias_act_layer(**kwargs)
 
     def D_block(self, x, res):
+        # 8x8 and up
+        t = x
         use_fp16 = self.should_use_fp16(res)
         with tf.name_scope(f'{2**res}x{2**res}') as top_scope:
-            if res >= 3: # 8x8 and up
-                with tf.name_scope('Conv') as scope:
-                    x = self.conv2d(x, fmaps=self.D_n_filters(res - 1), use_fp16=use_fp16, scope=scope)
-                    x = self.bias_act(x, clamp=self.conv_clamp, use_fp16=use_fp16, scope=scope)
-                    print(f'Conv x.shape = {x.shape}')
-                with tf.name_scope('Conv1_down') as scope:
-                    x = self.conv2d(x, fmaps=self.D_n_filters(res - 2), down=True, use_fp16=use_fp16, scope=scope)
-                    x = self.bias_act(x, clamp=self.conv_clamp, use_fp16=use_fp16, scope=scope)
-                    print(f'Conv1_down x.shape = {x.shape}')
-            else: # 4x4
-                if self.mbstd_group_size > 1:
-                    x = minibatch_stddev_layer(x, use_fp16, scope=top_scope, config=self.config)
-                    print(f'Mbstd x.shape = {x.shape}')
-                with tf.name_scope('Conv') as scope:
-                    x = self.conv2d(x, fmaps=self.D_n_filters(1), use_fp16=use_fp16, scope=scope)
-                    x = self.bias_act(x, clamp=self.conv_clamp, use_fp16=use_fp16, scope=scope)
-                with tf.name_scope('FullyConnected0') as scope:
-                    x = self.fc(x, units=self.D_n_filters(0), use_fp16=use_fp16, scope=scope)
-                    x = self.bias_act(x, use_fp16=use_fp16, scope=scope)
-                    print(f'FC0 x.shape = {x.shape}')
-                with tf.name_scope('FullyConnected1') as scope:
-                    x = self.fc(x, units=1, gain=1., use_fp16=use_fp16, scope=scope)
-                    x = self.bias_act(x, act_name='linear', use_fp16=use_fp16, scope=scope)
-                    print(f'FC1 x.shape = {x.shape}')
-            return x
+            with tf.name_scope('Conv') as scope:
+                x = self.conv2d(x, fmaps=self.D_n_filters(res - 1), use_fp16=use_fp16, scope=scope)
+                x = self.bias_act(x, clamp=self.conv_clamp, use_fp16=use_fp16, scope=scope)
+            with tf.name_scope('Conv1_down') as scope:
+                x = self.conv2d(x, fmaps=self.D_n_filters(res - 2), down=True, use_fp16=use_fp16, scope=scope)
+                x = self.bias_act(x, clamp=self.conv_clamp, use_fp16=use_fp16, scope=scope)
+            if self.D_architecture == RESNET_ARCHITECTURE:
+                with tf.name_scope('Skip') as scope:
+                    t = self.conv2d(t, fmaps=self.D_n_filters(res - 2), kernel_size=1, down=True, use_fp16=use_fp16, scope=scope)
+                    x = resnet_merge_layer(x, t, use_fp16=use_fp16, name=f'{2**res}x{2**res}/Resnet_merge/Lambda') # Looks better in TensorBoard
+        return x
+
+    def output_D_block(self, x, y):
+        # 4x4
+        use_fp16 = self.should_use_fp16(2)
+        with tf.name_scope('4x4') as top_scope:
+            if self.D_architecture == SKIP_ARCHITECTURE:
+                x = self.from_rgb(x, y, 2)
+            if self.mbstd_group_size > 1:
+                x = minibatch_stddev_layer(x, use_fp16, scope=top_scope, config=self.config)
+            with tf.name_scope('Conv') as scope:
+                x = self.conv2d(x, fmaps=self.D_n_filters(1), use_fp16=use_fp16, scope=scope)
+                x = self.bias_act(x, clamp=self.conv_clamp, use_fp16=use_fp16, scope=scope)
+            with tf.name_scope('FullyConnected0') as scope:
+                x = self.fc(x, units=self.D_n_filters(0), use_fp16=use_fp16, scope=scope)
+                x = self.bias_act(x, use_fp16=use_fp16, scope=scope)
+            with tf.name_scope('FullyConnected1') as scope:
+                x = self.fc(x, units=1, gain=1., use_fp16=use_fp16, scope=scope)
+                x = self.bias_act(x, act_name='linear', use_fp16=use_fp16, scope=scope)
+        return x
 
     def create_D_model(self):
         if self.D_model is None:
             print(f' ...Creating D model...')
-            # Build for input resolution.
-            model_res = self.resolution_log2
-            # Prepare inputs: t - main tensor, x - block tensor
             inputs = self.D_input_layer
-            x = inputs
-            if self.D_architecture == RESNET_ARCHITECTURE:
-                x = self.from_rgb(x, model_res)
-                t = x
-            else: #if self.D_architecture == SKIP_ARCHITECTURE:
-                t = x
-                x = self.from_rgb(x, model_res)
-            # Build for the remaining resolutions.
-            print(f'target_res = {self.resolution_log2}, start fp16 res = {self.start_fp16_resolution_log2}')
-            for res in range(model_res, 2 - 1, -1):
-                print(f'res = {res}, t.shape = {t.shape}, x.shape = {x.shape}')
+            x = None
+            y = inputs
+            # Build for the main resolutions.
+            for res in range(self.resolution_log2, 2, -1):
                 use_fp16 = self.should_use_fp16(res)
-                merge_postfix = f'merge_{2**res}x{2**res}'
-                # 1: apply block
+                if self.D_architecture == SKIP_ARCHITECTURE or res == self.resolution_log2:
+                    x = self.from_rgb(x, y, res)
                 x = self.D_block(x, res)
-                print(f'res = {res}, x.dtype = {x.dtype}, t.dtype = {t.dtype}')
-                # 2. update t and x
-                if self.D_architecture == RESNET_ARCHITECTURE:
-                    if res > 2:
-                        with tf.name_scope(f'Skip_{2**res}x{2**res}') as scope:
-                            t = self.conv2d(t, fmaps=self.D_n_filters(res - 2), kernel_size=1, down=True, use_fp16=use_fp16, scope=scope)
-                        t = resnet_merge_layer(x, t, use_fp16=use_fp16, name=f'Resnet_{merge_postfix}')
-                        x = t
-                else:  # if self.D_architecture == SKIP_ARCHITECTURE:
-                    # For the final resolution x is built
-                    t = self.downscale2d(t, use_fp16=use_fp16)
-                    if res > 2:
-                        next_use_fp16 = self.should_use_fp16(res - 1)
-                        x_input = tf.cast(x, tf.float16) if next_use_fp16 else x
-                        y_input = self.from_rgb(t, res - 1)
-                        x = skip_merge_layer(x_input, y_input, use_fp16=next_use_fp16, name=f'Skip_{merge_postfix}')
-                    else: #if res == 2:
-                        t = x
-
-            self.D_model = tf.keras.Model(inputs, tf.identity(t, name='scores_out'), name='D_style')
-            # D_model = FastTFModel(inputs, t, use_xla=self.use_xla, name='D_style')
+                if self.D_architecture == SKIP_ARCHITECTURE:
+                    y = self.downscale2d(y, use_fp16=use_fp16, name=f'Downscale2d_{2**res}x{2**res}')
+            # Build for the final layers.
+            x = self.output_D_block(x, y)
+            # Build final model.
+            scores_out = tf.identity(x, name='scores_out')
+            self.D_model = tf.keras.Model(inputs, scores_out, name='D_style')
+            # self.D_model = FastTFModel(inputs, scores_out, use_xla=self.use_xla, name='D_style')
         return self.D_model
 
     def initialize_D_model(self):
         images = tf.zeros(shape=[self.batch_size] + self.D_input_shape(self.resolution_log2), dtype=self.model_compute_dtype)
         _ = self.D_model(images, training=False)
+        try:
+            tf.keras.utils.plot_model(self.D_model, to_file='D_model.png', **PLOT_MODEL_KWARGS)
+        except Exception as e:
+            print('No image with D model architecture')
+            print(e)
         print(f' ...Initialized D model... ')
 
     def save_D_weights_in_class(self, D_model):
@@ -596,7 +593,8 @@ class Discriminator(ModelConfig):
 
     def trace_D_graph(self, summary_writer, writer_dir):
         trace_D_input = tf.zeros([1] + self.D_input_shape(self.resolution_log2), dtype=self.model_compute_dtype)
-        trace_D_model = tf.function(self.create_D_model())
+        trace_D_model = tf.function(self.D_model)
+        print('Tracing Discriminator model...')
         with summary_writer.as_default():
             tf.summary.trace_on(graph=True, profiler=True)
             trace_D_model(trace_D_input)

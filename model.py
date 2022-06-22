@@ -65,7 +65,8 @@ class StyleGAN2(ModelConfig):
     def __init__(self, config, mode=DEFAULT_MODE, images_paths=None):
         super(StyleGAN2, self).__init__(config)
 
-        if mode in [TRAIN_MODE, BENCHMARK_MODE]:
+        # TODO: think about removing inference mode (causes errors during graphs tracing)
+        if mode in [TRAIN_MODE, BENCHMARK_MODE, INFERENCE_MODE]:
             # Training images and batches
             self.latent_size = config.get(cfg.LATENT_SIZE, cfg.DEFAULT_LATENT_SIZE)
 
@@ -185,7 +186,7 @@ class StyleGAN2(ModelConfig):
         self.D_object.initialize_D_model()
         if self.use_Gs:
             with tf.device(self.Gs_device):
-                self.Gs_object.initialize_G_model()
+                self.Gs_object.initialize_G_model(plot_model=False)
                 G_model = self.G_object.create_G_model()
                 Gs_model = self.Gs_object.create_G_model()
                 Gs_model.set_weights(G_model.get_weights())
@@ -202,17 +203,13 @@ class StyleGAN2(ModelConfig):
         self.G_object.trace_G_graph(self.summary_writer, self.logs_path)
         self.D_object.trace_D_graph(self.summary_writer, self.logs_path)
 
-        self.G_object.initialize_G_model()
-        G_model = self.G_object.create_G_model()
         logging.info('\nGenerator network:\n')
         self.G_object.G_mapping.summary(print_fn=logging.info)
         self.G_object.G_synthesis.summary(print_fn=logging.info)
-        G_model.summary(print_fn=logging.info)
+        self.G_object.G_model.summary(print_fn=logging.info)
 
-        self.D_object.initialize_D_model()
-        D_model = self.D_object.create_D_model()
         logging.info('\nDiscriminator network:\n')
-        D_model.summary(print_fn=logging.info)
+        self.D_object.D_model.summary(print_fn=logging.info)
 
     def initialize_G_optimizer(self, benchmark: bool = False):
         c = self.G_reg_interval / (self.G_reg_interval + 1) if self.lazy_regularization else 1

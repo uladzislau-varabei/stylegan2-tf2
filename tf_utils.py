@@ -22,6 +22,15 @@ OS_LINUX = 'Linux'
 OS_WIN = 'Windows'
 RANDOMIZE_NOISE_VAR_NAME = 'is_random_noise'
 
+PLOT_MODEL_KWARGS = {
+    'show_shapes': True,
+    'show_dtype': True,
+    'show_layer_names': True,
+    'rankdir': 'TB',
+    'expand_nested': True,
+    'dpi': 96
+}
+
 
 #----------------------------------------------------------------------------
 # Activation functions utils.
