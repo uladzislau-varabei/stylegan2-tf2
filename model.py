@@ -189,9 +189,10 @@ class StyleGAN2(ModelConfig):
         if self.use_Gs:
             with tf.device(self.Gs_device):
                 self.Gs_object.initialize_G_model(plot_model=False)
-                G_model = self.G_object.create_G_model()
-                Gs_model = self.Gs_object.create_G_model()
+                G_model = self.G_object.G_model
+                Gs_model = self.Gs_object.G_model
                 Gs_model.set_weights(G_model.get_weights())
+        self.summary_models()
 
     def setup_Gs_beta(self):
         if self.Gs_beta is None:
@@ -337,21 +338,11 @@ class StyleGAN2(ModelConfig):
         total_time = time.time() - start_time
         logging.info(f'Images dataset initialized in {total_time:.3f} seconds!')
 
-    def create_models(self):
+    def get_models(self):
         # All models should be initialized before calling this function
-        D_model = self.D_object.create_D_model()
-        G_model = self.G_object.create_G_model()
-        logging.info('Creating Gs model')
-        if self.use_Gs:
-            Gs_model = self.Gs_object.create_G_model()
-            Gs_model.set_weights(G_model.get_weights())
-        else:
-            Gs_model = None
-
-        self.summary_models()
-
-        logging.info('Models created!')
-
+        D_model = self.D_object.D_model
+        G_model = self.G_object.G_model
+        Gs_model = self.Gs_object.G_model if self.use_Gs else None
         return D_model, G_model, Gs_model
 
     def update_models_weights(self, models):
@@ -763,7 +754,7 @@ class StyleGAN2(ModelConfig):
         self.init_training_time()
         self.reset_loss_scale_states()
 
-        D_model, G_model, Gs_model = self.create_models()
+        D_model, G_model, Gs_model = self.get_models()
         n_finished_images          = 0
         training_steps             = int(1000 * self.total_kimages) // self.batch_size
         tf_step                    = tf.Variable(n_finished_images, trainable=False, dtype=tf.int64)
@@ -830,7 +821,7 @@ class StyleGAN2(ModelConfig):
         self.init_training_time()
         self.reset_loss_scale_states()
 
-        D_model, G_model, Gs_model = self.create_models()
+        D_model, G_model, Gs_model = self.get_models()
         benchmark_steps            = images // self.batch_size
         n_finished_images          = 0
         tf_step                    = tf.Variable(0, trainable=False, dtype=tf.int64)

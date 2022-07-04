@@ -7,7 +7,7 @@ from config import Config as cfg
 from dnnlib.ops.upfirdn_2d import upsample_2d, downsample_2d, upsample_conv_2d, conv_downsample_2d, DEFAULT_IMPL
 from utils import validate_data_format
 from tf_utils import FUNC_KEY, GAIN_KEY, ACTIVATION_FUNCS_DICT, FP32_ACTIVATIONS,\
-    DEFAULT_DATA_FORMAT, NCHW_FORMAT, NHWC_FORMAT, RANDOMIZE_NOISE_VAR_NAME, RANDOM_NOISE_WEIGHT, HE_GAIN,\
+    DEFAULT_DATA_FORMAT, NCHW_FORMAT, NHWC_FORMAT, RANDOM_NOISE_WEIGHT, HE_GAIN,\
     PER_LAYER_COMPILATION, clip_by_value_preserve_gradient, lerp
 
 
