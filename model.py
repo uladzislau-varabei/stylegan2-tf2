@@ -16,19 +16,18 @@ from networks import ModelConfig, Generator, Discriminator
 # Utils imports
 from checkpoint_utils import save_model, load_model, save_optimizer_loss_scale, load_optimizer_loss_scale,\
     remove_old_models
-from utils import should_use_fp16,\
-    create_images_dir_path, create_images_grid_title,\
+from utils import create_images_dir_path, create_images_grid_title,\
     format_time, is_last_step, should_write_summary,\
     load_images_paths, fast_save_grid
 from utils import NHWC_FORMAT, NCHW_FORMAT,\
     DEFAULT_MODE, TRAIN_MODE, INFERENCE_MODE, BENCHMARK_MODE,\
     GENERATOR_NAME, DISCRIMINATOR_NAME, SMOOTH_POSTFIX, OPTIMIZER_POSTFIX,\
     CACHE_DIR, DATASET_CACHE_DIR, MODELS_DIR, TF_LOGS_DIR
-from tf_utils import generate_latents, is_finite_grad, update_loss_scale, should_update_loss_scale, \
+from tf_utils import tf_bool, is_finite_grad, update_loss_scale, should_update_loss_scale, \
     trace_vars, maybe_show_vars_stats, maybe_show_grads_stat, get_gpu_memory_usage,\
     maybe_scale_loss, maybe_unscale_grads, set_optimizer_iters, set_tf_logging,\
     smooth_model_weights, convert_outputs_to_images, run_model_on_batches
-from tf_utils import DEFAULT_DATA_FORMAT, toNCHW_AXIS, toNHWC_AXIS, MAX_LOSS_SCALE
+from tf_utils import PER_LAYER_COMPILATION, DEFAULT_DATA_FORMAT, toNCHW_AXIS, toNHWC_AXIS, MAX_LOSS_SCALE
 
 
 set_tf_logging(debug_mode=False)
@@ -54,10 +53,6 @@ SMOOTH_G_WEIGHTS_KEY         = 'smooth_G_weights'
 RESET_LOSS_SCALE_STATS_KEY   = 'reset_loss_scale_stats'
 EVALUATE_G_REG_KEY           = 'evaluate_G_reg'
 EVALUATE_D_REG_KEY           = 'evaluate_D_reg'
-
-
-def tf_bool(x):
-    return tf.convert_to_tensor(x, dtype=tf.bool)
 
 
 class StyleGAN2(ModelConfig):
@@ -133,18 +128,21 @@ class StyleGAN2(ModelConfig):
             self.save_images_every     = int(1000 * config.get(cfg.SAVE_IMAGES_EVERY_KIMAGES, cfg.DEFAULT_SAVE_IMAGES_EVERY_KIMAGES))
             self.logs_path             = os.path.join(MODELS_DIR, self.model_name, TF_LOGS_DIR)
             self.summary_writer        = tf.summary.create_file_writer(self.logs_path)
-            self.valid_latents         = self.initialize_valid_latents()
+
+            # Compilation
+            self.G_train_step     = tf.function(self.G_train_step)
+            self.G_reg_train_step = tf.function(self.G_reg_train_step)
+            self.D_train_step     = tf.function(self.D_train_step)
+            self.D_reg_train_step = tf.function(self.D_reg_train_step)
 
         self.G_object = Generator(config)
         self.D_object = Discriminator(config)
         # Maybe create smoothed generator
         if self.use_Gs:
             Gs_config = config
-            self.Gs_valid_latents = self.valid_latents
             self.Gs_device = '/GPU:0' if self.use_gpu_for_Gs else CPU_DEVICE
             if not self.use_gpu_for_Gs:
                 Gs_config[cfg.DATA_FORMAT] = NHWC_FORMAT
-                self.Gs_valid_latents = tf.transpose(self.valid_latents, toNHWC_AXIS)
             self.Gs_object = Generator(Gs_config)
 
         self.initialize_models()
@@ -153,6 +151,7 @@ class StyleGAN2(ModelConfig):
         else:
             self.setup_Gs_beta()
             self.create_images_dataset()
+            self.valid_latents, self.Gs_valid_latents = self.initialize_valid_latents()
             self.metrics_objects = setup_metrics(2 ** self.resolution_log2,
                                                  hw_ratio=self.dataset_hw_ratio,
                                                  dataset_params=self.dataset_params,
@@ -174,10 +173,13 @@ class StyleGAN2(ModelConfig):
             logging.info('Loaded valid latents from file')
         else:
             os.makedirs(latents_dir, exist_ok=True)
-            latents = self.generate_latents(self.valid_grid_nrows * self.valid_grid_ncols)
+            latents = self.G_object.G_model.generate_latents(self.valid_grid_nrows * self.valid_grid_ncols)
             np.save(latents_path, latents.numpy(), allow_pickle=False)
             logging.info('Valid latents not found. Created and saved new samples')
-        return latents
+        Gs_latents = latents # By default use usual latents
+        if self.use_Gs and not self.use_gpu_for_Gs:
+            Gs_latents = tf.transpose(latents, toNHWC_AXIS)
+        return latents, Gs_latents
 
     def initialize_models(self):
         if self.use_mixed_precision:
@@ -199,10 +201,7 @@ class StyleGAN2(ModelConfig):
         logging.info(f'Gs beta: {beta}')
         self.Gs_beta = beta
 
-    def trace_graphs(self):
-        self.G_object.trace_G_graph(self.summary_writer, self.logs_path)
-        self.D_object.trace_D_graph(self.summary_writer, self.logs_path)
-
+    def summary_models(self):
         logging.info('\nGenerator network:\n')
         self.G_object.G_mapping.summary(print_fn=logging.info)
         self.G_object.G_synthesis.summary(print_fn=logging.info)
@@ -210,6 +209,11 @@ class StyleGAN2(ModelConfig):
 
         logging.info('\nDiscriminator network:\n')
         self.D_object.D_model.summary(print_fn=logging.info)
+
+    def trace_graphs(self):
+        self.G_object.trace_G_graph(self.summary_writer, self.logs_path)
+        self.D_object.trace_D_graph(self.summary_writer, self.logs_path)
+        self.summary_models()
 
     def initialize_G_optimizer(self, benchmark: bool = False):
         c = self.G_reg_interval / (self.G_reg_interval + 1) if self.lazy_regularization else 1
@@ -344,12 +348,7 @@ class StyleGAN2(ModelConfig):
         else:
             Gs_model = None
 
-        # Log D model
-        D_model.summary(print_fn=logging.info)
-        # Log G model (mapping and synthesis networks)
-        self.G_object.G_mapping.summary(print_fn=logging.info)
-        self.G_object.G_synthesis.summary(print_fn=logging.info)
-        # G_model.summary(print_fn=logging.info)
+        self.summary_models()
 
         logging.info('Models created!')
 
@@ -378,19 +377,10 @@ class StyleGAN2(ModelConfig):
         maybe_show_vars_stats(D_model.trainable_variables, 'D stats after init:')
         maybe_show_vars_stats(G_model.trainable_variables, 'G stats after init:')
 
-        D_model = load_model(
-            D_model, self.model_name, DISCRIMINATOR_NAME,
-            step=step, storage_path=self.storage_path
-        )
-        G_model = load_model(
-            G_model, self.model_name, GENERATOR_NAME,
-            step=step, storage_path=self.storage_path
-        )
+        D_model = load_model(D_model, self.model_name, DISCRIMINATOR_NAME, step=step, storage_path=self.storage_path)
+        G_model = load_model(G_model, self.model_name, GENERATOR_NAME,  step=step, storage_path=self.storage_path)
         if Gs_model is not None:
-            Gs_model = load_model(
-                Gs_model, self.model_name, GENERATOR_NAME + SMOOTH_POSTFIX,
-                step=step, storage_path=self.storage_path
-            )
+            Gs_model = load_model(Gs_model, self.model_name, GENERATOR_NAME + SMOOTH_POSTFIX,  step=step, storage_path=self.storage_path)
 
         maybe_show_vars_stats(D_model.trainable_variables, '\nD stats after loading:')
         maybe_show_vars_stats(G_model.trainable_variables, '\nG stats after loading:')
@@ -481,11 +471,6 @@ class StyleGAN2(ModelConfig):
             save_in_jpg=save_in_jpg
         )
 
-    @tf.function
-    def generate_latents(self, batch_size):
-        return generate_latents(batch_size, self.latent_size, self.model_compute_dtype)
-
-    @tf.function
     def G_train_step(self, G_model, D_model, evaluate_reg, write_scalars_summary, write_hists_summary, step):
         G_vars = G_model.trainable_variables
         # Trace which variables are used to make sure that net is training
@@ -513,7 +498,6 @@ class StyleGAN2(ModelConfig):
         print('Compiled G train step')
         return G_grads
 
-    @tf.function
     def G_reg_train_step(self, G_model, D_model, write_scalars_summary, write_hists_summary, step):
         G_vars = G_model.trainable_variables
         # Trace which variables are used to make sure that net is training
@@ -540,7 +524,6 @@ class StyleGAN2(ModelConfig):
         print('Compiled G reg train step')
         return G_reg_grads
 
-    @tf.function
     def D_train_step(self, G_model, D_model, images, evaluate_reg, write_scalars_summary, write_hists_summary, step):
         D_vars = D_model.trainable_variables
         # Trace which variables are used to make sure that net is training
@@ -569,7 +552,6 @@ class StyleGAN2(ModelConfig):
         print('Compiled D train step')
         return D_grads
 
-    @tf.function
     def D_reg_train_step(self, G_model, D_model, images, write_scalars_summary, write_hists_summary, step):
         D_vars = D_model.trainable_variables
         # Trace which variables are used to make sure that net is training
@@ -586,7 +568,6 @@ class StyleGAN2(ModelConfig):
                                       write_summary=write_scalars_summary,
                                       step=step,
                                       **self.D_loss_params)
-
             D_reg = maybe_scale_loss(self.D_reg_interval * D_reg, self.D_optimizer)
 
         D_reg_grads = D_tape.gradient(D_reg, D_vars)
@@ -626,15 +607,17 @@ class StyleGAN2(ModelConfig):
 
     def train_step(self, G_model, D_model, images,
                    evaluate_G_reg, evaluate_D_reg, write_scalars_summary, write_hists_summary, step):
+        # Avoid unnecessary retracing
+        write_scalars_summary, write_hists_summary = tf_bool(write_scalars_summary), tf_bool(write_hists_summary)
         # Note: explicit use of G and D models allows to make sure that
         # tf.function doesn't compile models (can they be?). Additionally tracing is used
         D_grads = self.D_train_step(G_model, D_model, images,
-                                    evaluate_reg=tf_bool(False) if self.lazy_regularization else evaluate_D_reg,
+                                    evaluate_reg=tf_bool(False if self.lazy_regularization else evaluate_D_reg),
                                     write_scalars_summary=write_scalars_summary,
                                     write_hists_summary=write_hists_summary,
                                     step=step)
         G_grads = self.G_train_step(G_model, D_model,
-                                    evaluate_reg=tf_bool(False) if self.lazy_regularization else evaluate_G_reg,
+                                    evaluate_reg=tf_bool(False if self.lazy_regularization else evaluate_G_reg),
                                     write_scalars_summary=write_scalars_summary,
                                     write_hists_summary=write_hists_summary,
                                     step=step)
@@ -785,8 +768,6 @@ class StyleGAN2(ModelConfig):
         training_steps             = int(1000 * self.total_kimages) // self.batch_size
         tf_step                    = tf.Variable(n_finished_images, trainable=False, dtype=tf.int64)
 
-        print('Running training...')
-
         with self.summary_writer.as_default():
             for step in tqdm(range(training_steps), desc='Training'):
                 summary_options = self.train_step_options(step, training_steps, n_finished_images)
@@ -846,6 +827,7 @@ class StyleGAN2(ModelConfig):
         stage_start_time = time.time()
         compile_start_time = time.time()
         compile_total_time = 0
+        self.init_training_time()
         self.reset_loss_scale_states()
 
         D_model, G_model, Gs_model = self.create_models()
@@ -889,6 +871,7 @@ class StyleGAN2(ModelConfig):
 
         stage_total_time = time.time() - stage_start_time
         train_time = stage_total_time - metrics_time
+        print(f'\nResources: {self.resources}, PER LAYER COMPILE: {PER_LAYER_COMPILATION}')
         print(f'\nBenchmark finished in {format_time(stage_total_time)}. '
               f'Metrics run (2 iterations) in {format_time(metrics_time)}.\n'
               f'Compilation took {format_time(compile_total_time)}. \n'

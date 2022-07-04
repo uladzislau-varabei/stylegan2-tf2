@@ -7,7 +7,7 @@ import tensorflow as tf
 from metrics.metrics_base import MetricBase
 from metrics.lpips_models.lpips_tensorflow import vgg_perceptual_metric_model
 from utils import NCHW_FORMAT,to_hw_size, clean_array
-from tf_utils import toNHWC_AXIS, toNCHW_AXIS, lerp, generate_latents, enable_random_noise, disable_random_noise,\
+from tf_utils import toNHWC_AXIS, lerp, enable_random_noise, disable_random_noise,\
     enable_mixed_precision_policy, disable_mixed_precision_policy, extract_images
 
 
@@ -79,10 +79,10 @@ class PPL(MetricBase):
             images = tf.transpose(images, toNHWC_AXIS)
         return images
 
-    def evaluate_distance_for_batch(self, batch_size, G_mapping, G_synthesis):
+    def evaluate_distance_for_batch(self, batch_size, G_model):
+        G_mapping, G_synthesis = G_model.G_mapping, G_model.G_synthesis
         # Generate random latents and interpolation t-values.
-        # TODO: change to use a noise consistent with the one used by the model.
-        lat_t01 = generate_latents(batch_size * 2, G_mapping.input_shape[1],  self.compute_dtype)
+        lat_t01 = G_model.generate_latents(batch_size * 2)
         lerp_t = tf.random.uniform([batch_size], 0.0, 1.0 if self.sampling == 'full' else 0.0, dtype=self.compute_dtype)
 
         # Interpolate in W or Z.
@@ -110,25 +110,22 @@ class PPL(MetricBase):
         return batch_distance
 
     def run_metric(self, input_batch_size, G_model):
-        G_mapping = G_model.G_mapping
-        G_synthesis = G_model.G_synthesis
-
         randomize_noise = G_model.randomize_noise
         if randomize_noise:
             # This line is very important. Otherwise, images might have visible differences,
             # which leads to very high PPl scores, e.g., 2.5M-3.5M.
-            disable_random_noise(G_synthesis)
+            disable_random_noise(G_model)
 
         # Sampling loop.
         all_distances = []
         batch_size = self.get_batch_size(input_batch_size)
         for _ in tqdm(range(0, self.num_samples, batch_size), desc='PPL metric steps'):
-            all_distances.append(self.evaluate_distance_for_batch(batch_size, G_mapping, G_synthesis).numpy())
+            all_distances.append(self.evaluate_distance_for_batch(batch_size, G_model).numpy())
         all_distances = np.concatenate(all_distances, axis=0)
         all_distances = clean_array(all_distances)
 
         if randomize_noise:
-            enable_random_noise(G_synthesis)
+            enable_random_noise(G_model)
 
         # Reject outliers.
         lo = np.percentile(all_distances, 1, interpolation='lower')

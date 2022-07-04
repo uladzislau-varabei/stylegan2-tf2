@@ -7,8 +7,8 @@ from config import Config as cfg
 from dnnlib.ops.upfirdn_2d import upsample_2d, downsample_2d, upsample_conv_2d, conv_downsample_2d, DEFAULT_IMPL
 from utils import validate_data_format
 from tf_utils import FUNC_KEY, GAIN_KEY, ACTIVATION_FUNCS_DICT, FP32_ACTIVATIONS,\
-    DEFAULT_DATA_FORMAT, NCHW_FORMAT, NHWC_FORMAT, RANDOMIZE_NOISE_VAR_NAME, HE_GAIN,\
-    clip_by_value_preserve_gradient
+    DEFAULT_DATA_FORMAT, NCHW_FORMAT, NHWC_FORMAT, RANDOMIZE_NOISE_VAR_NAME, RANDOM_NOISE_WEIGHT, HE_GAIN,\
+    PER_LAYER_COMPILATION, clip_by_value_preserve_gradient, lerp
 
 
 LRMUL = 1.
@@ -20,6 +20,7 @@ DEFAULT_USE_WSCALE       = cfg.DEFAULT_USE_WSCALE
 DEFAULT_TRUNCATE_WEIGHTS = cfg.DEFAULT_TRUNCATE_WEIGHTS
 DEFAULT_DTYPE            = cfg.DEFAULT_DTYPE
 DEFAULT_USE_XLA          = cfg.DEFAULT_USE_XLA
+
 
 #----------------------------------------------------------------------------
 # Utils.
@@ -122,7 +123,8 @@ class AdvConv2d(Layer):
         self.use_xla = use_xla
         self.impl = impl
         self.scope = scope
-        self.call = tf.function(self.call, jit_compile=self.use_xla)
+        if PER_LAYER_COMPILATION:
+            self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def build(self, input_shape):
         if self.data_format == NCHW_FORMAT:
@@ -186,7 +188,8 @@ class ModulatedConv2d(Layer):
         self.epsilon = 1e-4 if self.use_fp16 else 1e-8
         self.scope = scope + 'ModConv2d/'
         self.style_scope = scope + 'StyleModFC/'
-        self.call = tf.function(self.call, jit_compile=self.use_xla)
+        if PER_LAYER_COMPILATION:
+            self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def build(self, input_shape):
         x_shape, style_shape = input_shape
@@ -295,7 +298,8 @@ class AdvFullyConnected(Layer):
         self.truncate_weights = truncate_weights
         self.use_xla = use_xla
         self.scope = scope
-        self.call = tf.function(self.call, jit_compile=self.use_xla)
+        if PER_LAYER_COMPILATION:
+            self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def build(self, input_shape):
         self.fan_in = np.prod(input_shape[1:])
@@ -331,7 +335,8 @@ class Bias(Layer):
         self.lrmul = lrmul
         self.use_xla = use_xla
         self.scope = scope
-        self.call = tf.function(self.call, jit_compile=self.use_xla)
+        if PER_LAYER_COMPILATION:
+            self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def build(self, input_shape):
         self.is_linear_bias = len(input_shape) == 2
@@ -369,7 +374,8 @@ class Upscale2d(Layer):
         self.factor = factor
         self.resample_kernel = resample_kernel
         self.use_xla = use_xla
-        self.call = tf.function(self.call, jit_compile=self.use_xla)
+        if PER_LAYER_COMPILATION:
+            self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def call(self, x, *args, **kwargs):
         return upsample_2d(x, k=self.resample_kernel, factor=self.factor, data_format=self.data_format)
@@ -385,7 +391,8 @@ class Downscale2d(Layer):
         self.factor = factor
         self.resample_kernel = resample_kernel
         self.use_xla = use_xla
-        self.call = tf.function(self.call, jit_compile=self.use_xla)
+        if PER_LAYER_COMPILATION:
+            self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def call(self, x, *args, **kwargs):
         return downsample_2d(x, k=self.resample_kernel, factor=self.factor, data_format=self.data_format)
@@ -401,7 +408,8 @@ class PixelNorm(Layer):
         self.data_format = data_format
         self.epsilon = 1e-8 if self._dtype_policy.compute_dtype == 'float32' else 1e-4
         self.use_xla = use_xla
-        self.call = tf.function(self.call, jit_compile=self.use_xla)
+        if PER_LAYER_COMPILATION:
+            self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def build(self, input_shape):
         # Layer might also be used to normalize latents, which hase shape [batch, channels]
@@ -432,9 +440,10 @@ class Noise(Layer):
         self.use_xla = use_xla
         self.scope = scope #+ 'Noise'
         self.tf_zero = tf.constant(0.0, dtype=self._dtype_policy.compute_dtype, name='zero')
-        # XLA doesn't seem to work.
-        # self.call = tf.function(self.call, jit_compile=self.use_xla)
-        self.call = tf.function(self.call, jit_compile=False)
+        if PER_LAYER_COMPILATION:
+            # XLA doesn't seem to work with tf.cond, so compile this layer explicitly with tf.function
+            # (doesn't work when model call is wrapped with jit_compile) or use lerp
+            self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def build(self, input_shape):
         if self.data_format == NCHW_FORMAT:
@@ -460,21 +469,19 @@ class Noise(Layer):
                 initializer=tf.random_normal_initializer(),
                 trainable=False
             )
-            # Add dummy non trainable variable to control randomness of noise
-            self.tf_randomize_noise = self.add_weight(
-                name=RANDOMIZE_NOISE_VAR_NAME,
-                initializer=tf.constant_initializer(1. if self.randomize_noise else -1.),
+            # Add weight to control weight for random noise
+            self.random_noise_weight = self.add_weight(
+                name=RANDOM_NOISE_WEIGHT,
+                initializer=tf.constant_initializer(1. if self.randomize_noise else 0.),
                 trainable=False,
                 dtype=self._dtype_policy.compute_dtype
             )
 
     def call(self, x, *args, **kwargs):
-        # One can change layer weights (see tf_randomize_noise) to switch between random and non random noise
-        noise = tf.cond(
-            tf.greater(self.tf_randomize_noise, self.tf_zero),
-            lambda: tf.random.normal([tf.shape(x)[0]] + self.noise_tail_shape, dtype=self._dtype_policy.compute_dtype),
-            lambda: tf.tile(self.const_noise, [tf.shape(x)[0], 1, 1, 1])
-        )
+        # One can change layer weights (see random_noise_weight) to switch between random and non random noise
+        rand_noise = tf.random.normal([tf.shape(x)[0]] + self.noise_tail_shape, dtype=self._dtype_policy.compute_dtype)
+        const_noise = tf.tile(self.const_noise, [tf.shape(x)[0], 1, 1, 1])
+        noise = lerp(const_noise, rand_noise, self.random_noise_weight)
         return x + noise * self.w
 
 
@@ -521,7 +528,8 @@ class MinibatchStdDev(Layer):
         self.group_size = group_size
         self.num_new_features = num_new_features
         self.use_xla = use_xla
-        self.call = tf.function(self.call, jit_compile=self.use_xla)
+        if PER_LAYER_COMPILATION:
+            self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def call(self, x, *args, **kwargs):
         if self.data_format == NCHW_FORMAT:
@@ -575,7 +583,8 @@ class Activation(Layer):
         self.clamp = clamp
         self.use_xla = use_xla
         self.scope = scope
-        self.call = tf.function(self.call, jit_compile=self.use_xla)
+        if PER_LAYER_COMPILATION:
+            self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def call(self, x, *args, **kwargs):
         x = self.act_gain * self.act_func(tf.cast(x, tf.float32) if self.fp32_act else x)
@@ -626,7 +635,8 @@ class FusedBiasAct(Layer):
         self.clamp = clamp
         self.use_xla = use_xla
         self.scope = scope
-        self.call = tf.function(self.call, jit_compile=self.use_xla)
+        if PER_LAYER_COMPILATION:
+            self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def build(self, input_shape):
         self.is_linear_bias = len(input_shape) == 2

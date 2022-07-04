@@ -4,15 +4,14 @@ from tensorflow.keras.layers import Input
 
 from config import Config as cfg
 from dnnlib.custom_layers import layer_dtype,\
-    fully_connected_layer, conv2d_layer, modulated_conv2d_layer, fused_bias_act_layer, bias_act_layer, const_layer, noise_layer, \
-    pixel_norm_layer, downscale2d_layer, upscale2d_layer, minibatch_stddev_layer,\
-    resnet_merge_layer, skip_merge_layer
+    fully_connected_layer, conv2d_layer, modulated_conv2d_layer, fused_bias_act_layer, bias_act_layer, const_layer, \
+    noise_layer, pixel_norm_layer, downscale2d_layer, upscale2d_layer, minibatch_stddev_layer, resnet_merge_layer, skip_merge_layer
 from checkpoint_utils import weights_to_dict, load_model_weights_from_dict
-from utils import level_of_details, validate_data_format, to_int_dict,\
+from utils import level_of_details, validate_data_format,\
     get_start_fp16_resolution, should_use_fp16, adjust_clamp,\
     NHWC_FORMAT, NCHW_FORMAT, RESNET_ARCHITECTURE, SKIP_ARCHITECTURE
 from tf_utils import generate_latents, get_compute_dtype, lerp, FastTFModel,\
-    DEFAULT_DATA_FORMAT, GAIN_INIT_MODE_DICT, GAIN_ACTIVATION_FUNS_DICT, PLOT_MODEL_KWARGS
+    PER_LAYER_COMPILATION, DEFAULT_DATA_FORMAT, GAIN_INIT_MODE_DICT, GAIN_ACTIVATION_FUNS_DICT, PLOT_MODEL_KWARGS
 
 
 def n_filters(stage, fmap_base, fmap_decay, fmap_max):
@@ -104,8 +103,10 @@ class GeneratorMapping(ModelConfig):
             x = tf.tile(x[:, tf.newaxis], [1, self.num_styles, 1])
 
         dlatents = tf.identity(x, name='dlatents')
-        self.G_mapping = tf.keras.Model(self.latents, dlatents, name='G_mapping')
-        # self.G_mapping = FastTFModel(self.latents, dlatents, use_xla=self.use_xla, name='G_mapping')
+        if PER_LAYER_COMPILATION:
+            self.G_mapping = tf.keras.Model(self.latents, dlatents, name='G_mapping')
+        else:
+            self.G_mapping = FastTFModel(self.latents, dlatents, use_xla=self.use_xla, name='G_mapping')
 
 
 class GeneratorStyle(tf.keras.Model, ModelConfig):
@@ -276,9 +277,7 @@ class Generator(ModelConfig):
         self.G_mapping = self.G_mapping_object.G_mapping
         # Use mapping network to get shape of dlatents
         self.dlatents = Input(self.G_mapping.output_shape[1:], dtype=self.model_compute_dtype, name='Dlatents')
-        self.toRGB_layers = {
-            res: self.to_rgb_layer(res) for res in range(2, self.resolution_log2 + 1)
-        }
+        self.toRGB_layers = {res: self.to_rgb_layer(res) for res in range(2, self.resolution_log2 + 1)}
 
     def to_rgb_layer(self, res):
         lod = level_of_details(res, self.resolution_log2)
@@ -384,8 +383,10 @@ class Generator(ModelConfig):
                     y = self.to_rgb(x, y, res)
             images_out = tf.identity(y, name='images_out')
             # Build models
-            self.G_synthesis = tf.keras.Model(self.dlatents, images_out, name='G_synthesis')
-            # self.G_model = FastTFModel(self.dlatents, images_out, use_xla=self.use_xla, name='G_synthesis')
+            if PER_LAYER_COMPILATION:
+                self.G_synthesis = tf.keras.Model(self.dlatents, images_out, name='G_synthesis')
+            else:
+                self.G_synthesis = FastTFModel(self.dlatents, images_out, use_xla=self.use_xla, name='G_synthesis')
             self.G_model = GeneratorStyle(self.G_mapping, self.G_synthesis, self.config)
         return self.G_model
 
@@ -465,9 +466,7 @@ class Discriminator(ModelConfig):
     def create_model_layers(self):
         self.D_input_layer = Input(shape=self.D_input_shape(self.resolution_log2), dtype=self.model_compute_dtype,
                                    name=f'Images_{2**self.resolution_log2}x{2**self.resolution_log2}')
-        self.fromRGB_layers = {
-            res: self.from_rgb_layer(res) for res in range(2, self.resolution_log2 + 1)
-        }
+        self.fromRGB_layers = {res: self.from_rgb_layer(res) for res in range(2, self.resolution_log2 + 1)}
 
     def from_rgb_layer(self, res):
         lod = level_of_details(res, self.resolution_log2)
@@ -571,8 +570,10 @@ class Discriminator(ModelConfig):
             x = self.output_D_block(x, y)
             # Build final model.
             scores_out = tf.identity(x, name='scores_out')
-            self.D_model = tf.keras.Model(inputs, scores_out, name='D_style')
-            # self.D_model = FastTFModel(inputs, scores_out, use_xla=self.use_xla, name='D_style')
+            if PER_LAYER_COMPILATION:
+                self.D_model = tf.keras.Model(inputs, scores_out, name='D_style')
+            else:
+                self.D_model = FastTFModel(inputs, scores_out, use_xla=self.use_xla, name='D_style')
         return self.D_model
 
     def initialize_D_model(self):

@@ -10,6 +10,7 @@ from utils import NCHW_FORMAT, NHWC_FORMAT,\
     should_log_debug_info, to_hw_size, validate_data_format, validate_hw_ratio
 
 
+PER_LAYER_COMPILATION = False
 DEFAULT_DATA_FORMAT = NCHW_FORMAT
 MAX_LOSS_SCALE = 2 ** 15 # Max loss scale taken from source code for LossScaleOptimizer. Valid for TF 2.5
 
@@ -20,7 +21,7 @@ toNCHW_AXIS = [0, 3, 1, 2]
 
 OS_LINUX = 'Linux'
 OS_WIN = 'Windows'
-RANDOMIZE_NOISE_VAR_NAME = 'is_random_noise'
+RANDOM_NOISE_WEIGHT = 'random_noise_weight'
 
 PLOT_MODEL_KWARGS = {
     'show_shapes': True,
@@ -183,14 +184,15 @@ def naive_downsample(x, factor, data_format=DEFAULT_DATA_FORMAT):
 
 def enable_random_noise(model: tf.keras.Model):
     for var in model.variables:
-        if RANDOMIZE_NOISE_VAR_NAME in var.name:
+        if RANDOM_NOISE_WEIGHT in var.name:
             var.assign(1.)
 
 
 def disable_random_noise(model: tf.keras.Model):
     for var in model.variables:
-        if RANDOMIZE_NOISE_VAR_NAME in var.name:
-            var.assign(-1.)
+        if RANDOM_NOISE_WEIGHT in var.name:
+            var.assign(0.)
+
 
 
 @tf.function
@@ -208,10 +210,21 @@ def smooth_model_weights(sm_model, src_model, beta, device):
 class FastTFModel(tf.keras.Model):
 
     def __init__(self, x, y, use_xla, name):
-        super(FastTFModel, self).__init__()
+        super(FastTFModel, self).__init__(name='Wrapped_' + name)
         self.model = tf.keras.Model(x, y, name=name)
         self.use_xla = use_xla
         self.call = tf.function(self.call, jit_compile=use_xla)
+
+    @property
+    def input_shape(self):
+        return self.model.input_shape
+
+    @property
+    def output_shape(self):
+        return self.model.output_shape
+
+    def summary(self, **kwargs):
+        return self.model.summary(**kwargs)
 
     def call(self, inputs, **kwargs):
         return self.model(inputs, **kwargs)
@@ -429,6 +442,10 @@ def get_gpu_memory_usage():
 
 # Linear interpolation
 def lerp(a, b, t):
+    """
+    a multiplied by (1 - t)
+    b multiplied by t
+    """
     return a + (b - a) * t
 
 
@@ -436,6 +453,10 @@ def fp32(*values):
     if len(values) == 1:
         return tf.cast(values[0], tf.float32)
     return [tf.cast(v, tf.float32) for v in values]
+
+
+def tf_bool(x):
+    return tf.convert_to_tensor(x, dtype=tf.bool)
 
 
 def run_model_on_batches(model, model_kwargs, inputs, batch_size):
@@ -456,7 +477,7 @@ def prepare_gpu(mode='auto', memory_limit=None):
 
     # Note: change this number based on your GPU
     if memory_limit is None:
-        memory_limit = 7750 # for real use. Larger values crash the app when starting (system after reboot, memory usage around 300 Mb)
+        memory_limit = 7600 # for real use. Larger values crash the app when starting (system after reboot, memory usage around 300 Mb)
         # memory_limit = 6000
     set_memory_growth = False
     set_memory_limit = False

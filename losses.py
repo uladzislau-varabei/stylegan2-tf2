@@ -7,9 +7,9 @@ from tf_utils import fp32, maybe_scale_loss, maybe_custom_unscale_grads
 
 def select_G_loss_fn(loss_name, use_xla=False):
     losses = {
-        'G_wgan'.lower(): G_wgan,
-        'G_logistic'.lower(): G_logistic_saturating,
-        'G_logistic_ns'.lower(): G_logistic_ns,
+        'G_wgan'.lower()               : G_wgan,
+        'G_logistic'.lower()           : G_logistic_saturating,
+        'G_logistic_ns'.lower()        : G_logistic_ns,
         'G_logistic_ns_pathreg'.lower(): G_logistic_ns_pathreg
     }
     assert loss_name.lower() in losses.keys(), \
@@ -19,9 +19,9 @@ def select_G_loss_fn(loss_name, use_xla=False):
 
 def select_D_loss_fn(loss_name, use_xla=False):
     losses = {
-        'D_wgan'.lower(): D_wgan,
-        'D_wgan_gp'.lower(): D_wgan_gp,
-        'D_logistic'.lower(): D_logistic,
+        'D_wgan'.lower()             : D_wgan,
+        'D_wgan_gp'.lower()          : D_wgan_gp,
+        'D_logistic'.lower()         : D_logistic,
         'D_logistic_simplegp'.lower(): D_logistic_simplegp
     }
     assert loss_name.lower() in losses.keys(), \
@@ -353,7 +353,6 @@ def G_logistic_ns_pathreg(G, D, optimizer, batch_size, evaluate_loss, evaluate_r
         nans = tf.math.count_nonzero(~tf.math.is_finite(pl_lengths))
         if nans == 0:
             # 3. Track exponential moving average of |J*y|.
-            tf.print('Current pl mean:', loss_vars.pl_mean_var)
             pl_mean = loss_vars.pl_mean_var + pl_decay * (tf_mean(pl_lengths) - loss_vars.pl_mean_var)
             loss_vars.pl_mean_var.assign(pl_mean)
 
@@ -370,7 +369,6 @@ def G_logistic_ns_pathreg(G, D, optimizer, batch_size, evaluate_loss, evaluate_r
             pl_mean = 0.0
             pl_penalty = 0.0
         reg = pl_weight * pl_penalty
-        tf.print('pl_mean:', pl_mean)
     else:
         pl_mean = 0.0
         pl_penalty = 0.0
@@ -382,7 +380,8 @@ def G_logistic_ns_pathreg(G, D, optimizer, batch_size, evaluate_loss, evaluate_r
                 tf.summary.scalar('FakeScores', tf_mean(fake_scores), step=step)
                 tf.summary.scalar('Total', tf_mean(loss), step=step)
             if evaluate_reg:
-                tf.summary.scalar('PLMean', pl_mean, step=step)
+                tf.summary.scalar('PLTrackedMean', loss_vars.pl_mean_var, step=step)
+                tf.summary.scalar('PLBatchMean', pl_mean, step=step)
                 tf.summary.scalar('PLPenalty', tf_mean(pl_penalty), step=step)
                 tf.summary.scalar('PLReg', tf_mean(reg), step=step)
 
